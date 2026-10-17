@@ -1659,14 +1659,7 @@ def api_update_tender_status(tender_id):
         if not row:
             return jsonify({"error": "not found"}), 404
 
-        # Human approved → start document preparation (async)
-        if status == "APPROVED":
-            threading.Thread(
-                target=prepare_documents_for_tender,
-                args=(str(tender_id),),
-                daemon=True,
-            ).start()
-
+        # APPROVED stays APPROVED until explicit prepare_documents_for_tender
         return jsonify(row)
     except Exception as e:
         print(f"❌ api_update_tender_status: {e}", flush=True)
@@ -1684,11 +1677,7 @@ def api_approve_tender(tender_id):
         row = _set_tender_status(tender_id, "APPROVED")
         if not row:
             return jsonify({"error": "not found"}), 404
-        threading.Thread(
-            target=prepare_documents_for_tender,
-            args=(str(tender_id),),
-            daemon=True,
-        ).start()
+        # Stay on APPROVED — document prep is a separate step (app or /prepare-docs)
         return jsonify(row)
     except Exception as e:
         print(f"❌ api_approve_tender: {e}", flush=True)

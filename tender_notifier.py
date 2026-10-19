@@ -1705,8 +1705,25 @@ def api_reject_tender(tender_id):
 # `python app.py` local runs and gunicorn/production imports)
 init_db()
 
+# Under gunicorn __name__ is not "__main__", so the scanner never started.
+# Start the background eGP/2merkato loop on import (safe with workers=1).
+_monitor_started = False
+_monitor_lock = threading.Lock()
+
+def _ensure_monitor_started():
+    global _monitor_started
+    if os.environ.get("DISABLE_MONITOR", "").strip().lower() in ("1", "true", "yes"):
+        return
+    with _monitor_lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+        threading.Thread(target=monitoring_loop, daemon=True).start()
+        print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
+
+_ensure_monitor_started()
+
 if __name__ == "__main__":
-    threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 

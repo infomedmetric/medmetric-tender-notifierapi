@@ -365,6 +365,13 @@ TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
+SCAN_DIAGNOSTICS = {
+    "started_at": None,
+    "completed_at": None,
+    "two_merkato_candidates": None,
+    "egp_candidates": None,
+}
+SCAN_LOCK = threading.Lock()
 
 # CORRECT domain — the working tenders app, not www.2merkato.com
 MERKATO_BASE = "https://tender.2merkato.com"
@@ -461,7 +468,7 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction","road"
+    "term life", "gpa", "spare part", "construction", "road",
     "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
@@ -599,7 +606,15 @@ def is_already_notified(tender_id: str) -> bool:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
+        cur.execute(
+            """
+            SELECT 1 FROM notified_tenders WHERE tender_id = %s
+            UNION ALL
+            SELECT 1 FROM tenders WHERE id = %s
+            LIMIT 1
+            """,
+            (tender_id, tender_id),
+        )
         result = cur.fetchone()
         cur.close()
         return result is not None
@@ -746,6 +761,8 @@ def send_whatsapp(message):
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
 def scrape_2merkato(candidates: list):
     print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
+    if not (MERKATO_USER and MERKATO_PASS):
+        print("ℹ️ MERKATO_USER/MERKATO_PASS are not both configured; trying public 2merkato listings without login.", flush=True)
     found = 0
 
     try:
@@ -951,6 +968,9 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
                     if status == "closed":
                         print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
                         mark_as_notified(tender_id)
+                        continue
+                    if status != "open":
+                        print(f"⏭️ Skipping 2merkato tender because an explicit open bidding status was not confirmed: {title_text}", flush=True)
                         continue
 
                     # NOTE: do NOT mark_as_notified() here — same reasoning as
@@ -1280,6 +1300,10 @@ def scrape_egp(candidates: list):
 
 def check_for_tenders():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
+    SCAN_DIAGNOSTICS["started_at"] = datetime.now(timezone.utc).isoformat()
+    SCAN_DIAGNOSTICS["completed_at"] = None
+    SCAN_DIAGNOSTICS["two_merkato_candidates"] = None
+    SCAN_DIAGNOSTICS["egp_candidates"] = None
 
     candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
 
@@ -1289,6 +1313,7 @@ def check_for_tenders():
         print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
         merkato_found = 0
+    SCAN_DIAGNOSTICS["two_merkato_candidates"] = int(merkato_found or 0)
 
     try:
         # API-based eGP does not hang like the old Playwright path, so run
@@ -1300,6 +1325,7 @@ def check_for_tenders():
         print("❌ eGP engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
         egp_found = 0
+    SCAN_DIAGNOSTICS["egp_candidates"] = int(egp_found or 0)
 
     print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
 
@@ -1414,7 +1440,7 @@ def check_for_tenders():
                     ai_reason=str(reason or "")[:500],
                     procurement_object=str(procurement_object or "")[:500],
                     constraints_text=str(constraints or "")[:1000],
-                    force_status=True,  # first time we see it as relevant
+                    force_status=False,  # preserve any existing human/server status on duplicate IDs
                 )
                 mark_as_notified(c["id"])
                 total_sent += 1
@@ -1436,6 +1462,33 @@ def check_for_tenders():
         if os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
             send_whatsapp("🔍 Tender scan completed. No new matches for approval.")
 
+    SCAN_DIAGNOSTICS["completed_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_locked_scan():
+    """Run one scan whose SCAN_LOCK was acquired by the caller."""
+    try:
+        check_for_tenders()
+    except Exception:
+        print("❌ check_for_tenders crashed at the top level:", flush=True)
+        print(traceback.format_exc(), flush=True)
+    finally:
+        if SCAN_DIAGNOSTICS.get("started_at") and not SCAN_DIAGNOSTICS.get("completed_at"):
+            SCAN_DIAGNOSTICS["completed_at"] = datetime.now(timezone.utc).isoformat()
+        SCAN_LOCK.release()
+
+
+def _start_scan_thread() -> bool:
+    """Start an asynchronous scan if no monitor/mobile scan is already running."""
+    if not SCAN_LOCK.acquire(blocking=False):
+        return False
+    try:
+        threading.Thread(target=_run_locked_scan, daemon=True).start()
+        return True
+    except Exception:
+        SCAN_LOCK.release()
+        raise
+
 
 def monitoring_loop():
     # Configurable via Render env var so this doesn't need a code change next time —
@@ -1445,11 +1498,10 @@ def monitoring_loop():
     except ValueError:
         interval_hours = 6
     while True:
-        try:
-            check_for_tenders()
-        except Exception:
-            print("❌ check_for_tenders crashed at the top level:", flush=True)
-            print(traceback.format_exc(), flush=True)
+        if SCAN_LOCK.acquire(blocking=False):
+            _run_locked_scan()
+        else:
+            print("ℹ️ Scheduled scan skipped because another scan is already running.", flush=True)
         time.sleep(interval_hours * 3600)
 
 
@@ -1471,19 +1523,74 @@ def manual_test():
     if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
         return "Unauthorized", 401
 
-    threading.Thread(target=check_for_tenders).start()
-    return "Scraper sync cycle triggered!", 200
+    if not _start_scan_thread():
+        return jsonify({"status": "running", "message": "A tender scan is already running."}), 202
+    return jsonify({"status": "started", "message": "Tender source scan started."}), 202
 
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
+    database_connected = False
+    if DATABASE_URL:
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            database_connected = cur.fetchone() is not None
+            cur.close()
+        except Exception as e:
+            print(f"⚠️ Health check database probe failed: {e}", flush=True)
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     return jsonify({
         "ok": True,
         "service": "tender-notifier",
         "mobile_api": True,
+        "database_configured": bool(DATABASE_URL),
+        "database_connected": database_connected,
+        "scan_running": SCAN_LOCK.locked(),
         "approval_workflow": True,
         "statuses": sorted(TENDER_STATUSES),
+        "sources": ["2merkato", "eGP"],
+        "merkato_login_configured": bool(MERKATO_USER and MERKATO_PASS),
+        "last_scan": dict(SCAN_DIAGNOSTICS),
     })
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_trigger_scan():
+    """Trigger both configured source scrapers; Postgres credentials remain on this server."""
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if not DATABASE_URL:
+        return jsonify({"error": "Database not configured on the tender service."}), 503
+    completed_at = SCAN_DIAGNOSTICS.get("completed_at")
+    if completed_at and not SCAN_LOCK.locked():
+        try:
+            cooldown_minutes = max(0, int(os.environ.get("MOBILE_SCAN_COOLDOWN_MINUTES", "10")))
+            completed_dt = datetime.fromisoformat(completed_at)
+            age_seconds = (datetime.now(timezone.utc) - completed_dt).total_seconds()
+            if age_seconds < cooldown_minutes * 60:
+                return jsonify({
+                    "status": "recent",
+                    "message": f"A source scan completed {int(age_seconds)} seconds ago; cooldown is {cooldown_minutes} minutes.",
+                }), 200
+        except (TypeError, ValueError):
+            pass
+    try:
+        started = _start_scan_thread()
+    except Exception as e:
+        print(f"❌ api_trigger_scan: {e}", flush=True)
+        return jsonify({"error": "Could not start tender scan."}), 500
+    return jsonify({
+        "status": "started" if started else "running",
+        "message": "Tender source scan started." if started else "A tender source scan is already running.",
+    }), 202
 
 
 def _row_to_tender(r):
@@ -1726,4 +1833,3 @@ _ensure_monitor_started()
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-

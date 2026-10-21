@@ -363,21 +363,41 @@ if not WHATSAPP_NUMBERS:
 # demand, burning your Groq quota and spamming your WhatsApp numbers.
 TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
+# ---- Scan diagnostics (read via GET /api/scan-report) ----
+SCAN_LOCK = threading.Lock()
+SCAN_REPORT = {
+    "running": False, "started_at": None, "finished_at": None,
+    "sources": {
+        "merkato": {"configured": False, "login_ok": None, "raw_links": 0, "relevant": 0,
+                    "closed_skipped": 0, "already_notified": 0, "candidates": 0, "error": None},
+        "egp": {"candidates": 0, "error": None},
+    },
+    "queued": 0, "ai_rejected": 0, "log": [],
+}
+
+
+def _rep_log(msg: str):
+    print(msg, flush=True)
+    try:
+        SCAN_REPORT["log"].append(f"{datetime.now().strftime('%H:%M:%S')} {msg}"[:300])
+        del SCAN_REPORT["log"][:-60]
+    except Exception:
+        pass
+
+
+def _mk():
+    return SCAN_REPORT["sources"]["merkato"]
+
+
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
-SCAN_DIAGNOSTICS = {
-    "started_at": None,
-    "completed_at": None,
-    "two_merkato_candidates": None,
-    "egp_candidates": None,
-}
-SCAN_LOCK = threading.Lock()
 
 # CORRECT domain — the working tenders app, not www.2merkato.com
 MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
+MERKATO_TIME_BUDGET_SEC = int(os.environ.get("MERKATO_TIME_BUDGET_SEC", "420"))
 
 # The eGP domain has moved/varied before (production.egp.gov.et vs plain
 # egp.gov.et, and there's a real chance it could live at something like
@@ -468,8 +488,8 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction", "road",
-    "laboratory", "lab reagent", "reagent", "lab equipment",
+    "term life", "gpa", "spare part", "construction", "road construction",
+    "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
 ]
@@ -534,9 +554,9 @@ def get_db_connection():
 # Allowed tender statuses for the human-in-the-loop agent
 TENDER_STATUSES = {
     "PENDING_APPROVAL",  # AI found relevant — waiting for human Approve/Reject
-    "APPROVED",          # Human approved — agent prepares documents
+    "APPROVED",          # Human approved — documents are drafted in the app next
     "REJECTED",          # Human rejected
-    "DOCS_READY",        # Technical + Financial drafts ready
+    "DOCS_READY",        # Technical + Financial drafts exist (reported by the app)
     "DOCS_FAILED",       # Document preparation failed
     "REVIEWING",
     "WON",
@@ -583,6 +603,8 @@ def init_db():
             ("ai_reason", "TEXT"),
             ("procurement_object", "TEXT"),
             ("constraints_text", "TEXT"),
+            ("technical_draft", "TEXT"),
+            ("financial_draft", "TEXT"),
         ]:
             try:
                 cur.execute(f"ALTER TABLE tenders ADD COLUMN IF NOT EXISTS {col} {typ}")
@@ -606,19 +628,16 @@ def is_already_notified(tender_id: str) -> bool:
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT 1 FROM notified_tenders WHERE tender_id = %s
-            UNION ALL
-            SELECT 1 FROM tenders WHERE id = %s
-            LIMIT 1
-            """,
-            (tender_id, tender_id),
-        )
+        cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
         result = cur.fetchone()
+        conn.commit()
         cur.close()
         return result is not None
     except Exception as e:
+        try:
+            get_db_connection().rollback()
+        except Exception:
+            pass
         print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
         return tender_id in _MEMORY_FALLBACK
 
@@ -637,6 +656,10 @@ def mark_as_notified(tender_id: str):
         conn.commit()
         cur.close()
     except Exception as e:
+        try:
+            get_db_connection().rollback()
+        except Exception:
+            pass
         print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
         _MEMORY_FALLBACK.add(tender_id)
 
@@ -674,7 +697,9 @@ def upsert_tender_record(
         conn = get_db_connection()
         cur = conn.cursor()
         if force_status:
-            status_sql = "status = EXCLUDED.status,"
+            # Never let a re-scan revert a human decision (APPROVED/REJECTED/DOCS_*...)
+            # back to PENDING_APPROVAL: only overwrite when the row is still pending.
+            status_sql = "status = CASE WHEN tenders.status IN ('PENDING_APPROVAL','NEW') OR tenders.status IS NULL THEN EXCLUDED.status ELSE tenders.status END,"
         else:
             # Only set status on first insert; keep human decisions on update
             status_sql = ""
@@ -717,6 +742,10 @@ def upsert_tender_record(
         conn.commit()
         cur.close()
     except Exception as e:
+        try:
+            get_db_connection().rollback()
+        except Exception:
+            pass
         print(f"⚠️ upsert_tender_record failed for {tender_id}: {e}", flush=True)
 
 
@@ -760,10 +789,14 @@ def send_whatsapp(message):
 
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
 def scrape_2merkato(candidates: list):
-    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
-    if not (MERKATO_USER and MERKATO_PASS):
-        print("ℹ️ MERKATO_USER/MERKATO_PASS are not both configured; trying public 2merkato listings without login.", flush=True)
+    _rep_log("🔍 Running 2merkato Engine (Playwright)...")
     found = 0
+    t_start = time.time()
+    mk = _mk()
+    mk["configured"] = bool(MERKATO_USER and MERKATO_PASS)
+    if not mk["configured"]:
+        _rep_log("⚠️ MERKATO_USER / MERKATO_PASS are NOT set on Render — scanning 2merkato anonymously (results are usually limited or empty). Add both in Render → Environment.")
+    browser = None
 
     try:
         with sync_playwright() as p:
@@ -804,11 +837,25 @@ def scrape_2merkato(candidates: list):
                         ).first
                         submit_btn.click()
                         page.wait_for_timeout(4000)
-                        print(f"✅ Submitted login, current URL: {page.url}", flush=True)
+                        try:
+                            still_login = page.locator("input[type='password']").count() > 0 or "/login" in page.url
+                            err_txt = ""
+                            if still_login:
+                                err_txt = (page.locator("[class*='error' i], [role='alert']").first.inner_text(timeout=1500) or "")[:120]
+                        except Exception:
+                            still_login, err_txt = False, ""
+                        mk["login_ok"] = not still_login
+                        if still_login:
+                            mk["error"] = f"login appears to have FAILED (still on login page). {err_txt}".strip()
+                            _rep_log(f"❌ 2merkato login failed — check MERKATO_USER/MERKATO_PASS. {err_txt}")
+                        else:
+                            _rep_log(f"✅ 2merkato login OK, current URL: {page.url}")
                     else:
                         print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
                 except Exception as e:
-                    print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
+                    mk["login_ok"] = False
+                    mk["error"] = f"login error: {e}"[:200]
+                    _rep_log(f"⚠️ Login attempt failed, continuing without auth: {e}")
 
             page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
@@ -844,10 +891,26 @@ def scrape_2merkato(candidates: list):
 
             if search_input.count() == 0:
                 print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
-                links = page.locator("a[href*='/tenders/']").all()
-                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
-                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
+                seen_fb = set()
+                for pg in range(1, MERKATO_MAX_PAGES + 1):
+                    if time.time() - t_start > MERKATO_TIME_BUDGET_SEC:
+                        _rep_log("⏱️ 2merkato time budget reached during fallback crawl")
+                        break
+                    if pg > 1:
+                        try:
+                            page.goto(f"{MERKATO_TENDERS_URL}?page={pg}", timeout=30000, wait_until="domcontentloaded")
+                            page.wait_for_timeout(2000)
+                        except Exception as e:
+                            _rep_log(f"⚠️ fallback page {pg} failed: {e}")
+                            break
+                    links = page.locator("a[href*='/tenders/']").all()
+                    mk["raw_links"] += len(links)
+                    _rep_log(f"Fallback listing page {pg}: found {len(links)} raw tender links")
+                    if not links:
+                        break
+                    found += _process_merkato_links(links, context, candidates, seen_fb)
                 browser.close()
+                browser = None
                 print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
                 return found
 
@@ -855,6 +918,9 @@ def scrape_2merkato(candidates: list):
 
             seen_this_scan = set()
             for term in MERKATO_SEARCH_TERMS:
+                if time.time() - t_start > MERKATO_TIME_BUDGET_SEC:
+                    _rep_log("⏱️ 2merkato time budget reached — stopping keyword search early")
+                    break
                 try:
                     if search_input.count() == 0 or not search_input.is_visible():
                         toggle = page.locator(
@@ -905,6 +971,7 @@ def scrape_2merkato(candidates: list):
                                 break
 
                         links = page.locator("a[href*='/tenders/']").all()
+                        mk["raw_links"] += len(links)
                         print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
                         if not links:
                             break
@@ -916,12 +983,20 @@ def scrape_2merkato(candidates: list):
                     continue
 
             browser.close()
+            browser = None
 
-        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
+        mk["candidates"] = found
+        _rep_log(f"2merkato engine complete. Collected {found} candidate matches for AI review.")
         return found
 
     except Exception as e:
-        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
+        mk["error"] = f"engine down: {e}"[:200]
+        _rep_log(f"❌ 2merkato extraction engine down: {e}")
+        try:
+            if browser is not None:
+                browser.close()
+        except Exception:
+            pass
         return 0
 
 
@@ -962,15 +1037,16 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
             seen_this_scan.add(full_link)
 
             if is_relevant_tender(title_text):
+                _mk()["relevant"] += 1
                 tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
+                if is_already_notified(tender_id):
+                    _mk()["already_notified"] += 1
                 if not is_already_notified(tender_id):
                     status = _get_merkato_card_status(link)
                     if status == "closed":
                         print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
+                        _mk()["closed_skipped"] += 1
                         mark_as_notified(tender_id)
-                        continue
-                    if status != "open":
-                        print(f"⏭️ Skipping 2merkato tender because an explicit open bidding status was not confirmed: {title_text}", flush=True)
                         continue
 
                     # NOTE: do NOT mark_as_notified() here — same reasoning as
@@ -1298,12 +1374,8 @@ def scrape_egp(candidates: list):
         return 0
 
 
-def check_for_tenders():
+def _check_for_tenders_inner():
     print("=================== STARTING SCAN CYCLE ===================", flush=True)
-    SCAN_DIAGNOSTICS["started_at"] = datetime.now(timezone.utc).isoformat()
-    SCAN_DIAGNOSTICS["completed_at"] = None
-    SCAN_DIAGNOSTICS["two_merkato_candidates"] = None
-    SCAN_DIAGNOSTICS["egp_candidates"] = None
 
     candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
 
@@ -1313,7 +1385,6 @@ def check_for_tenders():
         print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
         merkato_found = 0
-    SCAN_DIAGNOSTICS["two_merkato_candidates"] = int(merkato_found or 0)
 
     try:
         # API-based eGP does not hang like the old Playwright path, so run
@@ -1321,11 +1392,12 @@ def check_for_tenders():
         # previously killed a successful 182-item collection before results
         # could be passed back to the parent).
         egp_found = scrape_egp(candidates)
-    except Exception:
+        SCAN_REPORT["sources"]["egp"]["candidates"] = egp_found
+    except Exception as _e:
+        SCAN_REPORT["sources"]["egp"]["error"] = str(_e)[:200]
         print("❌ eGP engine crashed with an unhandled exception:", flush=True)
         print(traceback.format_exc(), flush=True)
         egp_found = 0
-    SCAN_DIAGNOSTICS["egp_candidates"] = int(egp_found or 0)
 
     print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
 
@@ -1395,6 +1467,7 @@ def check_for_tenders():
                 # it possible to sanity-check a borderline rejection (e.g. a
                 # title that LOOKED relevant) without digging through the
                 # WhatsApp thread for context that was never sent there
+                SCAN_REPORT["ai_rejected"] += 1
                 print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
                 # This is a genuine, AI-verified rejection (not a transient
                 # failure — those keep is_relevant forced True above), so it's
@@ -1440,10 +1513,11 @@ def check_for_tenders():
                     ai_reason=str(reason or "")[:500],
                     procurement_object=str(procurement_object or "")[:500],
                     constraints_text=str(constraints or "")[:1000],
-                    force_status=False,  # preserve any existing human/server status on duplicate IDs
+                    force_status=True,  # first time we see it as relevant
                 )
                 mark_as_notified(c["id"])
                 total_sent += 1
+                SCAN_REPORT["queued"] = total_sent
                 print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
             except Exception as _up_err:
                 print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
@@ -1462,32 +1536,23 @@ def check_for_tenders():
         if os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
             send_whatsapp("🔍 Tender scan completed. No new matches for approval.")
 
-    SCAN_DIAGNOSTICS["completed_at"] = datetime.now(timezone.utc).isoformat()
 
-
-def _run_locked_scan():
-    """Run one scan whose SCAN_LOCK was acquired by the caller."""
-    try:
-        check_for_tenders()
-    except Exception:
-        print("❌ check_for_tenders crashed at the top level:", flush=True)
-        print(traceback.format_exc(), flush=True)
-    finally:
-        if SCAN_DIAGNOSTICS.get("started_at") and not SCAN_DIAGNOSTICS.get("completed_at"):
-            SCAN_DIAGNOSTICS["completed_at"] = datetime.now(timezone.utc).isoformat()
-        SCAN_LOCK.release()
-
-
-def _start_scan_thread() -> bool:
-    """Start an asynchronous scan if no monitor/mobile scan is already running."""
+def check_for_tenders():
+    """Serialised wrapper: periodic loop and manual /api/scan never overlap."""
     if not SCAN_LOCK.acquire(blocking=False):
-        return False
+        print("⏭️ Scan already running — skipping this trigger", flush=True)
+        return
     try:
-        threading.Thread(target=_run_locked_scan, daemon=True).start()
-        return True
-    except Exception:
+        SCAN_REPORT.update({"running": True, "started_at": datetime.now(timezone.utc).isoformat(),
+                            "finished_at": None, "queued": 0, "ai_rejected": 0, "log": []})
+        SCAN_REPORT["sources"]["merkato"].update({"configured": False, "login_ok": None, "raw_links": 0, "relevant": 0,
+                                                  "closed_skipped": 0, "already_notified": 0, "candidates": 0, "error": None})
+        SCAN_REPORT["sources"]["egp"].update({"candidates": 0, "error": None})
+        _check_for_tenders_inner()
+    finally:
+        SCAN_REPORT["running"] = False
+        SCAN_REPORT["finished_at"] = datetime.now(timezone.utc).isoformat()
         SCAN_LOCK.release()
-        raise
 
 
 def monitoring_loop():
@@ -1498,10 +1563,11 @@ def monitoring_loop():
     except ValueError:
         interval_hours = 6
     while True:
-        if SCAN_LOCK.acquire(blocking=False):
-            _run_locked_scan()
-        else:
-            print("ℹ️ Scheduled scan skipped because another scan is already running.", flush=True)
+        try:
+            check_for_tenders()
+        except Exception:
+            print("❌ check_for_tenders crashed at the top level:", flush=True)
+            print(traceback.format_exc(), flush=True)
         time.sleep(interval_hours * 3600)
 
 
@@ -1523,74 +1589,19 @@ def manual_test():
     if not hmac.compare_digest(provided_token, TEST_CHECK_TOKEN):
         return "Unauthorized", 401
 
-    if not _start_scan_thread():
-        return jsonify({"status": "running", "message": "A tender scan is already running."}), 202
-    return jsonify({"status": "started", "message": "Tender source scan started."}), 202
+    threading.Thread(target=check_for_tenders).start()
+    return "Scraper sync cycle triggered!", 200
 
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
-    database_connected = False
-    if DATABASE_URL:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("SELECT 1")
-            database_connected = cur.fetchone() is not None
-            cur.close()
-        except Exception as e:
-            print(f"⚠️ Health check database probe failed: {e}", flush=True)
-        finally:
-            if conn:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
     return jsonify({
         "ok": True,
         "service": "tender-notifier",
         "mobile_api": True,
-        "database_configured": bool(DATABASE_URL),
-        "database_connected": database_connected,
-        "scan_running": SCAN_LOCK.locked(),
         "approval_workflow": True,
         "statuses": sorted(TENDER_STATUSES),
-        "sources": ["2merkato", "eGP"],
-        "merkato_login_configured": bool(MERKATO_USER and MERKATO_PASS),
-        "last_scan": dict(SCAN_DIAGNOSTICS),
     })
-
-
-@app.route("/api/scan", methods=["POST"])
-def api_trigger_scan():
-    """Trigger both configured source scrapers; Postgres credentials remain on this server."""
-    if not _mobile_api_authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-    if not DATABASE_URL:
-        return jsonify({"error": "Database not configured on the tender service."}), 503
-    completed_at = SCAN_DIAGNOSTICS.get("completed_at")
-    if completed_at and not SCAN_LOCK.locked():
-        try:
-            cooldown_minutes = max(0, int(os.environ.get("MOBILE_SCAN_COOLDOWN_MINUTES", "10")))
-            completed_dt = datetime.fromisoformat(completed_at)
-            age_seconds = (datetime.now(timezone.utc) - completed_dt).total_seconds()
-            if age_seconds < cooldown_minutes * 60:
-                return jsonify({
-                    "status": "recent",
-                    "message": f"A source scan completed {int(age_seconds)} seconds ago; cooldown is {cooldown_minutes} minutes.",
-                }), 200
-        except (TypeError, ValueError):
-            pass
-    try:
-        started = _start_scan_thread()
-    except Exception as e:
-        print(f"❌ api_trigger_scan: {e}", flush=True)
-        return jsonify({"error": "Could not start tender scan."}), 500
-    return jsonify({
-        "status": "started" if started else "running",
-        "message": "Tender source scan started." if started else "A tender source scan is already running.",
-    }), 202
 
 
 def _row_to_tender(r):
@@ -1612,6 +1623,9 @@ def _row_to_tender(r):
         d["ai_reason"] = r[11]
         d["procurement_object"] = r[12]
         d["constraints"] = r[13]
+    if len(r) > 15:
+        d["technical_draft"] = r[14]
+        d["financial_draft"] = r[15]
     return d
 
 
@@ -1640,7 +1654,8 @@ def api_list_tenders():
         sql = """
             SELECT id, title, description, source, deadline,
                    relevance_score, status, budget, url, created_at, updated_at,
-                   ai_reason, procurement_object, constraints_text
+                   ai_reason, procurement_object, constraints_text,
+                   technical_draft, financial_draft
             FROM tenders
             WHERE COALESCE(relevance_score, 0) >= %s
         """
@@ -1679,7 +1694,8 @@ def api_get_tender(tender_id):
             """
             SELECT id, title, description, source, deadline,
                    relevance_score, status, budget, url, created_at, updated_at,
-                   ai_reason, procurement_object, constraints_text
+                   ai_reason, procurement_object, constraints_text,
+                   technical_draft, financial_draft
             FROM tenders WHERE id = %s
             """,
             (str(tender_id),),
@@ -1695,116 +1711,169 @@ def api_get_tender(tender_id):
 
 
 def _set_tender_status(tender_id: str, status: str, title_fallback: str = ""):
-    """Internal helper: update status and return the full row dict."""
+    """Update a tender's status and return the full row dict.
+
+    Unknown ids return None (-> HTTP 404). A row is only created when the caller
+    explicitly supplies a title (phone-originated tender), never from a bare id.
+    """
+    cols = """id, title, description, source, deadline,
+              relevance_score, status, budget, url, created_at, updated_at,
+              ai_reason, procurement_object, constraints_text,
+              technical_draft, financial_draft"""
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO tenders (id, title, status, updated_at)
-        VALUES (%s, %s, %s, NOW())
-        ON CONFLICT (id) DO UPDATE SET
-            status = EXCLUDED.status,
-            updated_at = NOW()
-        RETURNING id, title, description, source, deadline,
-                  relevance_score, status, budget, url, created_at, updated_at,
-                  ai_reason, procurement_object, constraints_text
-        """,
-        (str(tender_id), (title_fallback or str(tender_id))[:500], status),
-    )
-    row = cur.fetchone()
-    conn.commit()
-    cur.close()
-    return _row_to_tender(row) if row else None
-
-
-def prepare_documents_for_tender(tender_id: str):
-    """
-    Called after human APPROVE.
-    Phase 1 stub: mark DOCS_READY and log.
-    Phase 2 (next): generate Technical + Financial .docx/.pdf using samples + AI.
-    """
-    print(f"📄 Document preparation started for tender {tender_id}", flush=True)
     try:
-        if not DATABASE_URL:
-            return
-        # Placeholder until sample proposals are provided and generation is wired
-        _set_tender_status(tender_id, "DOCS_READY")
-        print(f"✅ Tender {tender_id} marked DOCS_READY (stub — real generation coming next)", flush=True)
+        if title_fallback:
+            cur.execute(
+                f"""
+                INSERT INTO tenders (id, title, status, updated_at)
+                VALUES (%s, %s, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
+                RETURNING {cols}
+                """,
+                (str(tender_id), title_fallback[:500], status),
+            )
+        else:
+            cur.execute(
+                f"UPDATE tenders SET status = %s, updated_at = NOW() WHERE id = %s RETURNING {cols}",
+                (status, str(tender_id)),
+            )
+        row = cur.fetchone()
+        conn.commit()
+        return _row_to_tender(row) if row else None
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def _get_tender_status(tender_id: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT status, title FROM tenders WHERE id = %s", (str(tender_id),))
+        row = cur.fetchone()
+        conn.commit()  # end the read transaction on the shared connection
+        return row
+    finally:
+        cur.close()
+
+
+def _notify_approved(tender_id: str, title: str):
+    """Short, truthful WhatsApp note. Documents are drafted on the phone, not here."""
+    try:
         send_whatsapp(
-            f"✅ Tender approved.\n"
-            f"Document preparation started for: {tender_id}\n"
-            f"(Technical + Financial drafts will appear in the app shortly.)"
+            f"✅ Tender approved: {title or tender_id}\n"
+            f"Open the medMETRIC app → Tenders → Prepare documents."
         )
     except Exception as e:
-        print(f"❌ prepare_documents_for_tender failed: {e}", flush=True)
-        try:
-            _set_tender_status(tender_id, "DOCS_FAILED")
-        except Exception:
-            pass
+        print(f"⚠️ approve notification failed: {e}", flush=True)
+
+
+def _apply_status(tender_id: str, status: str, title: str = ""):
+    """Shared by /status, /approve, /reject. Returns a Flask response."""
+    if not DATABASE_URL:
+        return jsonify({"id": tender_id, "status": status})
+    try:
+        previous = _get_tender_status(tender_id)
+        if previous is None and not title:
+            return jsonify({"error": "tender not found in cloud"}), 404
+        # Approving twice must not re-notify.
+        if previous and previous[0] == status:
+            row = _set_tender_status(tender_id, status)
+            return jsonify(row)
+        row = _set_tender_status(tender_id, status, title_fallback=title)
+        if not row:
+            return jsonify({"error": "tender not found in cloud"}), 404
+        if status == "APPROVED":
+            _notify_approved(tender_id, row.get("title") or "")
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ _apply_status({tender_id}, {status}): {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/tenders/<tender_id>/status", methods=["PATCH", "POST"])
 def api_update_tender_status(tender_id):
-    """Update tender status (Approve / Reject / Won / Lost / ...).
+    """Update tender status (Approve / Reject / DOCS_READY / Won / Lost / ...).
 
-    Body: {"status": "APPROVED"} or {"status": "REJECTED"} etc.
-    When status becomes APPROVED, document preparation is triggered in background.
+    Body: {"status": "DOCS_READY"}  (optional "title" to create a phone-originated tender)
+    Documents are drafted on the phone; it reports DOCS_READY / DOCS_FAILED here.
     """
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
-
     body = request.get_json(silent=True) or {}
     status = (body.get("status") or "").upper().strip()
     if status not in TENDER_STATUSES:
         return jsonify({"error": f"status must be one of {sorted(TENDER_STATUSES)}"}), 400
-
-    if not DATABASE_URL:
-        return jsonify({"id": tender_id, "status": status})
-
-    try:
-        row = _set_tender_status(tender_id, status, title_fallback=body.get("title") or "")
-        if not row:
-            return jsonify({"error": "not found"}), 404
-
-        # APPROVED stays APPROVED until explicit prepare_documents_for_tender
-        return jsonify(row)
-    except Exception as e:
-        print(f"❌ api_update_tender_status: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
+    return _apply_status(tender_id, status, body.get("title") or "")
 
 
 @app.route("/api/tenders/<tender_id>/approve", methods=["POST"])
 def api_approve_tender(tender_id):
-    """Convenience endpoint: Approve a tender (same as status=APPROVED)."""
+    """Approve a tender. Status becomes APPROVED; DOCS_READY is set only when the phone has drafts."""
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
-    if not DATABASE_URL:
-        return jsonify({"id": tender_id, "status": "APPROVED"})
-    try:
-        row = _set_tender_status(tender_id, "APPROVED")
-        if not row:
-            return jsonify({"error": "not found"}), 404
-        # Stay on APPROVED — document prep is a separate step (app or /prepare-docs)
-        return jsonify(row)
-    except Exception as e:
-        print(f"❌ api_approve_tender: {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
+    return _apply_status(tender_id, "APPROVED")
 
 
 @app.route("/api/tenders/<tender_id>/reject", methods=["POST"])
 def api_reject_tender(tender_id):
-    """Convenience endpoint: Reject a tender."""
+    """Reject a tender."""
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    return _apply_status(tender_id, "REJECTED")
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan_now():
+    """Start a scan in the background (phone: "Scan now")."""
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    if SCAN_REPORT.get("running"):
+        return jsonify({"running": True}), 200
+    threading.Thread(target=check_for_tenders, daemon=True).start()
+    return jsonify({"started": True}), 202
+
+
+@app.route("/api/scan-report", methods=["GET"])
+def api_scan_report():
+    if not _mobile_api_authorized():
+        return jsonify({"error": "Unauthorized"}), 401
+    return jsonify(SCAN_REPORT)
+
+
+@app.route("/api/tenders/<tender_id>/drafts", methods=["POST", "PUT"])
+def api_save_drafts(tender_id):
+    """Back up the phone-generated drafts so they survive reinstalls."""
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
     if not DATABASE_URL:
-        return jsonify({"id": tender_id, "status": "REJECTED"})
+        return jsonify({"id": tender_id, "status": "DOCS_READY"})
+    body = request.get_json(silent=True) or {}
+    tech = str(body.get("technical") or "")[:60000]
+    fin = str(body.get("financial") or "")[:60000]
     try:
-        row = _set_tender_status(tender_id, "REJECTED")
-        if not row:
-            return jsonify({"error": "not found"}), 404
-        return jsonify(row)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE tenders SET technical_draft = %s, financial_draft = %s, status = 'DOCS_READY', updated_at = NOW() WHERE id = %s",
+                (tech, fin, str(tender_id)),
+            )
+            n = cur.rowcount
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+        if not n:
+            return jsonify({"error": "tender not found in cloud"}), 404
+        return jsonify({"id": tender_id, "status": "DOCS_READY"})
     except Exception as e:
-        print(f"❌ api_reject_tender: {e}", flush=True)
+        print(f"❌ api_save_drafts: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1812,24 +1881,8 @@ def api_reject_tender(tender_id):
 # `python app.py` local runs and gunicorn/production imports)
 init_db()
 
-# Under gunicorn __name__ is not "__main__", so the scanner never started.
-# Start the background eGP/2merkato loop on import (safe with workers=1).
-_monitor_started = False
-_monitor_lock = threading.Lock()
-
-def _ensure_monitor_started():
-    global _monitor_started
-    if os.environ.get("DISABLE_MONITOR", "").strip().lower() in ("1", "true", "yes"):
-        return
-    with _monitor_lock:
-        if _monitor_started:
-            return
-        _monitor_started = True
-        threading.Thread(target=monitoring_loop, daemon=True).start()
-        print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
-
-_ensure_monitor_started()
-
 if __name__ == "__main__":
+    threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+

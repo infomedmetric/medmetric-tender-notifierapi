@@ -363,31 +363,17 @@ if not WHATSAPP_NUMBERS:
 # demand, burning your Groq quota and spamming your WhatsApp numbers.
 TEST_CHECK_TOKEN = os.environ.get("TEST_CHECK_TOKEN")
 
-# ---- Scan diagnostics (read via GET /api/scan-report) ----
-SCAN_LOCK = threading.Lock()
-SCAN_REPORT = {
-    "running": False, "started_at": None, "finished_at": None,
-    "sources": {
-        "merkato": {"configured": False, "login_ok": None, "raw_links": 0, "relevant": 0,
-                    "closed_skipped": 0, "already_notified": 0, "candidates": 0, "error": None},
-        "egp": {"candidates": 0, "error": None},
-    },
-    "queued": 0, "ai_rejected": 0, "log": [],
+# In-memory scan status for mobile /api/health and /api/scan
+_scan_lock = threading.Lock()
+_scan_running = False
+_last_scan = {
+    "started_at": None,
+    "completed_at": None,
+    "two_merkato_candidates": None,
+    "egp_candidates": None,
+    "queued_for_approval": None,
+    "error": None,
 }
-
-
-def _rep_log(msg: str):
-    print(msg, flush=True)
-    try:
-        SCAN_REPORT["log"].append(f"{datetime.now().strftime('%H:%M:%S')} {msg}"[:300])
-        del SCAN_REPORT["log"][:-60]
-    except Exception:
-        pass
-
-
-def _mk():
-    return SCAN_REPORT["sources"]["merkato"]
-
 
 MERKATO_USER = os.environ.get("MERKATO_USER")
 MERKATO_PASS = os.environ.get("MERKATO_PASS")
@@ -397,7 +383,6 @@ MERKATO_BASE = "https://tender.2merkato.com"
 MERKATO_LOGIN_URL = f"{MERKATO_BASE}/login"
 MERKATO_TENDERS_URL = f"{MERKATO_BASE}/tenders"
 MERKATO_MAX_PAGES = int(os.environ.get("MERKATO_MAX_PAGES", "4"))
-MERKATO_TIME_BUDGET_SEC = int(os.environ.get("MERKATO_TIME_BUDGET_SEC", "420"))
 
 # The eGP domain has moved/varied before (production.egp.gov.et vs plain
 # egp.gov.et, and there's a real chance it could live at something like
@@ -488,8 +473,8 @@ EQUIPMENT_CONTEXT = ["equipment", "supplies", "supply", "device", "machine",
 # biomedical engineering/technical-service company, not a drug supplier.
 HARD_EXCLUDE_TERMS = [
     "vehicle", "toyota", "car ", "motorbike", "insurance", "life insurance",
-    "term life", "gpa", "spare part", "construction", "road construction",
-    "lab reagent", "reagent", "lab equipment",
+    "term life", "gpa", "spare part", "construction","road"
+    "laboratory", "lab reagent", "reagent", "lab equipment",
     "medicine", "medicines", "pharmaceutical", "pharmaceuticals",
     "drug", "drugs", "vaccine", "vaccines", "rdf medicine", "rdf medicines"
 ]
@@ -554,9 +539,9 @@ def get_db_connection():
 # Allowed tender statuses for the human-in-the-loop agent
 TENDER_STATUSES = {
     "PENDING_APPROVAL",  # AI found relevant — waiting for human Approve/Reject
-    "APPROVED",          # Human approved — documents are drafted in the app next
+    "APPROVED",          # Human approved — agent prepares documents
     "REJECTED",          # Human rejected
-    "DOCS_READY",        # Technical + Financial drafts exist (reported by the app)
+    "DOCS_READY",        # Technical + Financial drafts ready
     "DOCS_FAILED",       # Document preparation failed
     "REVIEWING",
     "WON",
@@ -603,18 +588,112 @@ def init_db():
             ("ai_reason", "TEXT"),
             ("procurement_object", "TEXT"),
             ("constraints_text", "TEXT"),
-            ("technical_draft", "TEXT"),
-            ("financial_draft", "TEXT"),
         ]:
             try:
                 cur.execute(f"ALTER TABLE tenders ADD COLUMN IF NOT EXISTS {col} {typ}")
             except Exception:
                 pass
+        # Shared scan state across gunicorn workers (in-memory alone is per-process)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scan_status (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                running BOOLEAN DEFAULT FALSE,
+                started_at TIMESTAMPTZ,
+                completed_at TIMESTAMPTZ,
+                two_merkato_candidates INTEGER,
+                egp_candidates INTEGER,
+                queued_for_approval INTEGER,
+                error TEXT,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+        cur.execute(
+            "INSERT INTO scan_status (id, running) VALUES (1, FALSE) ON CONFLICT (id) DO NOTHING"
+        )
         conn.commit()
         cur.close()
-        print("✅ Connected to Postgres and verified notified_tenders + tenders tables", flush=True)
+        print("✅ Connected to Postgres and verified notified_tenders + tenders + scan_status tables", flush=True)
     except Exception as e:
         print(f"❌ Postgres init failed, falling back to in-memory dedup: {e}", flush=True)
+
+
+
+
+def _persist_scan_state(running=None, **fields):
+    """Write scan progress to Postgres so all gunicorn workers see the same state."""
+    global _scan_running, _last_scan
+    if running is not None:
+        _scan_running = bool(running)
+        _last_scan["running"] = _scan_running
+    for k, v in fields.items():
+        _last_scan[k] = v
+    if not DATABASE_URL:
+        return
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        sets = ["updated_at = NOW()"]
+        vals = []
+        if running is not None:
+            sets.append("running = %s")
+            vals.append(bool(running))
+        for col in ("started_at", "completed_at", "two_merkato_candidates", "egp_candidates", "queued_for_approval", "error"):
+            if col in fields:
+                sets.append(f"{col} = %s")
+                vals.append(fields[col])
+        vals.append(1)
+        cur.execute(f"UPDATE scan_status SET {', '.join(sets)} WHERE id = %s", vals)
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        print(f"⚠️ persist scan_status failed: {e}", flush=True)
+
+
+def _load_scan_state_from_db():
+    """Merge Postgres scan_status into in-memory mirrors (multi-worker safe)."""
+    global _scan_running, _last_scan
+    if not DATABASE_URL:
+        return dict(_last_scan), _scan_running
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT running, started_at, completed_at, two_merkato_candidates, egp_candidates,
+                      queued_for_approval, error FROM scan_status WHERE id = 1"""
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return dict(_last_scan), _scan_running
+        running = bool(row[0])
+        last = {
+            "started_at": row[1].isoformat() if row[1] else None,
+            "completed_at": row[2].isoformat() if row[2] else None,
+            "two_merkato_candidates": row[3],
+            "egp_candidates": row[4],
+            "queued_for_approval": row[5],
+            "error": row[6],
+        }
+        _scan_running = running
+        _last_scan.update(last)
+        return last, running
+    except Exception as e:
+        print(f"⚠️ load scan_status failed: {e}", flush=True)
+        return dict(_last_scan), _scan_running
+
+
+def database_is_connected() -> bool:
+    if not DATABASE_URL:
+        return False
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT 1")
+        cur.fetchone()
+        cur.close()
+        return True
+    except Exception:
+        return False
 
 
 # In-memory fallback used only if DATABASE_URL is missing or unreachable —
@@ -630,14 +709,9 @@ def is_already_notified(tender_id: str) -> bool:
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM notified_tenders WHERE tender_id = %s", (tender_id,))
         result = cur.fetchone()
-        conn.commit()
         cur.close()
         return result is not None
     except Exception as e:
-        try:
-            get_db_connection().rollback()
-        except Exception:
-            pass
         print(f"⚠️ DB check failed for {tender_id}, using memory fallback: {e}", flush=True)
         return tender_id in _MEMORY_FALLBACK
 
@@ -656,10 +730,6 @@ def mark_as_notified(tender_id: str):
         conn.commit()
         cur.close()
     except Exception as e:
-        try:
-            get_db_connection().rollback()
-        except Exception:
-            pass
         print(f"⚠️ DB insert failed for {tender_id}, using memory fallback: {e}", flush=True)
         _MEMORY_FALLBACK.add(tender_id)
 
@@ -697,9 +767,7 @@ def upsert_tender_record(
         conn = get_db_connection()
         cur = conn.cursor()
         if force_status:
-            # Never let a re-scan revert a human decision (APPROVED/REJECTED/DOCS_*...)
-            # back to PENDING_APPROVAL: only overwrite when the row is still pending.
-            status_sql = "status = CASE WHEN tenders.status IN ('PENDING_APPROVAL','NEW') OR tenders.status IS NULL THEN EXCLUDED.status ELSE tenders.status END,"
+            status_sql = "status = EXCLUDED.status,"
         else:
             # Only set status on first insert; keep human decisions on update
             status_sql = ""
@@ -742,10 +810,6 @@ def upsert_tender_record(
         conn.commit()
         cur.close()
     except Exception as e:
-        try:
-            get_db_connection().rollback()
-        except Exception:
-            pass
         print(f"⚠️ upsert_tender_record failed for {tender_id}: {e}", flush=True)
 
 
@@ -789,14 +853,8 @@ def send_whatsapp(message):
 
 # ==================== ENGINE: 2MERKATO (Playwright) ====================
 def scrape_2merkato(candidates: list):
-    _rep_log("🔍 Running 2merkato Engine (Playwright)...")
+    print(f"[{datetime.now()}] 🔍 Running 2merkato Engine (Playwright)...", flush=True)
     found = 0
-    t_start = time.time()
-    mk = _mk()
-    mk["configured"] = bool(MERKATO_USER and MERKATO_PASS)
-    if not mk["configured"]:
-        _rep_log("⚠️ MERKATO_USER / MERKATO_PASS are NOT set on Render — scanning 2merkato anonymously (results are usually limited or empty). Add both in Render → Environment.")
-    browser = None
 
     try:
         with sync_playwright() as p:
@@ -837,25 +895,11 @@ def scrape_2merkato(candidates: list):
                         ).first
                         submit_btn.click()
                         page.wait_for_timeout(4000)
-                        try:
-                            still_login = page.locator("input[type='password']").count() > 0 or "/login" in page.url
-                            err_txt = ""
-                            if still_login:
-                                err_txt = (page.locator("[class*='error' i], [role='alert']").first.inner_text(timeout=1500) or "")[:120]
-                        except Exception:
-                            still_login, err_txt = False, ""
-                        mk["login_ok"] = not still_login
-                        if still_login:
-                            mk["error"] = f"login appears to have FAILED (still on login page). {err_txt}".strip()
-                            _rep_log(f"❌ 2merkato login failed — check MERKATO_USER/MERKATO_PASS. {err_txt}")
-                        else:
-                            _rep_log(f"✅ 2merkato login OK, current URL: {page.url}")
+                        print(f"✅ Submitted login, current URL: {page.url}", flush=True)
                     else:
                         print(f"⚠️ Could not confidently identify email/username field among: {field_info}", flush=True)
                 except Exception as e:
-                    mk["login_ok"] = False
-                    mk["error"] = f"login error: {e}"[:200]
-                    _rep_log(f"⚠️ Login attempt failed, continuing without auth: {e}")
+                    print(f"⚠️ Login attempt failed, continuing without auth: {e}", flush=True)
 
             page.goto(MERKATO_TENDERS_URL, timeout=30000, wait_until="domcontentloaded")
             page.wait_for_timeout(2000)
@@ -891,26 +935,10 @@ def scrape_2merkato(candidates: list):
 
             if search_input.count() == 0:
                 print("❌ 2merkato search-by-keyword input never appeared — falling back to the old first-page listing so this scan isn't a total loss.", flush=True)
-                seen_fb = set()
-                for pg in range(1, MERKATO_MAX_PAGES + 1):
-                    if time.time() - t_start > MERKATO_TIME_BUDGET_SEC:
-                        _rep_log("⏱️ 2merkato time budget reached during fallback crawl")
-                        break
-                    if pg > 1:
-                        try:
-                            page.goto(f"{MERKATO_TENDERS_URL}?page={pg}", timeout=30000, wait_until="domcontentloaded")
-                            page.wait_for_timeout(2000)
-                        except Exception as e:
-                            _rep_log(f"⚠️ fallback page {pg} failed: {e}")
-                            break
-                    links = page.locator("a[href*='/tenders/']").all()
-                    mk["raw_links"] += len(links)
-                    _rep_log(f"Fallback listing page {pg}: found {len(links)} raw tender links")
-                    if not links:
-                        break
-                    found += _process_merkato_links(links, context, candidates, seen_fb)
+                links = page.locator("a[href*='/tenders/']").all()
+                print(f"Fallback listing page: found {len(links)} raw tender links", flush=True)
+                found += _process_merkato_links(links, context, candidates, seen_this_scan=set())
                 browser.close()
-                browser = None
                 print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
                 return found
 
@@ -918,9 +946,6 @@ def scrape_2merkato(candidates: list):
 
             seen_this_scan = set()
             for term in MERKATO_SEARCH_TERMS:
-                if time.time() - t_start > MERKATO_TIME_BUDGET_SEC:
-                    _rep_log("⏱️ 2merkato time budget reached — stopping keyword search early")
-                    break
                 try:
                     if search_input.count() == 0 or not search_input.is_visible():
                         toggle = page.locator(
@@ -971,7 +996,6 @@ def scrape_2merkato(candidates: list):
                                 break
 
                         links = page.locator("a[href*='/tenders/']").all()
-                        mk["raw_links"] += len(links)
                         print(f"2merkato search '{term}' page {page_num}: found {len(links)} raw tender links", flush=True)
                         if not links:
                             break
@@ -983,20 +1007,12 @@ def scrape_2merkato(candidates: list):
                     continue
 
             browser.close()
-            browser = None
 
-        mk["candidates"] = found
-        _rep_log(f"2merkato engine complete. Collected {found} candidate matches for AI review.")
+        print(f"2merkato engine complete. Collected {found} candidate matches for AI review.", flush=True)
         return found
 
     except Exception as e:
-        mk["error"] = f"engine down: {e}"[:200]
-        _rep_log(f"❌ 2merkato extraction engine down: {e}")
-        try:
-            if browser is not None:
-                browser.close()
-        except Exception:
-            pass
+        print(f"❌ 2merkato extraction engine down: {e}", flush=True)
         return 0
 
 
@@ -1037,15 +1053,11 @@ def _process_merkato_links(links, context, candidates: list, seen_this_scan: set
             seen_this_scan.add(full_link)
 
             if is_relevant_tender(title_text):
-                _mk()["relevant"] += 1
                 tender_id = f"merkato_{full_link.rstrip('/').split('/')[-1]}"
-                if is_already_notified(tender_id):
-                    _mk()["already_notified"] += 1
                 if not is_already_notified(tender_id):
                     status = _get_merkato_card_status(link)
                     if status == "closed":
                         print(f"⏭️ Skipping closed 2merkato tender (Bidding: Closed): {title_text}", flush=True)
-                        _mk()["closed_skipped"] += 1
                         mark_as_notified(tender_id)
                         continue
 
@@ -1374,185 +1386,219 @@ def scrape_egp(candidates: list):
         return 0
 
 
-def _check_for_tenders_inner():
-    print("=================== STARTING SCAN CYCLE ===================", flush=True)
-
-    candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
-
-    try:
-        merkato_found = scrape_2merkato(candidates)
-    except Exception:
-        print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
-        print(traceback.format_exc(), flush=True)
-        merkato_found = 0
-
-    try:
-        # API-based eGP does not hang like the old Playwright path, so run
-        # in-process to guarantee candidates are returned (subprocess timeout
-        # previously killed a successful 182-item collection before results
-        # could be passed back to the parent).
-        egp_found = scrape_egp(candidates)
-        SCAN_REPORT["sources"]["egp"]["candidates"] = egp_found
-    except Exception as _e:
-        SCAN_REPORT["sources"]["egp"]["error"] = str(_e)[:200]
-        print("❌ eGP engine crashed with an unhandled exception:", flush=True)
-        print(traceback.format_exc(), flush=True)
-        egp_found = 0
-
-    print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
-
-    total_sent = 0
-    if candidates:
-        # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
-        # every candidate from both engines — instead of the old per-tender
-        # approach that could burn a day's free-tier quota in a single scan.
-        # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
-        # notifications — each tender still gets sent as its own message
-        # below, since that's easier to read/forward than one long combined
-        # message.
-        batch_results = batch_analyze_tenders(candidates)
-
-        for i, c in enumerate(candidates):
-            result = batch_results.get(i) if batch_results is not None else None
-
-            if batch_results is None:
-                # The whole batch call failed even after retries (e.g. quota
-                # exhausted). Fall back to sending everything that passed the
-                # keyword filter, clearly flagged as unverified, rather than
-                # silently dropping legitimate tenders.
-                is_relevant = True
-                match_score = "?"
-                reason = "AI batch analysis unavailable — keyword match only"
-                procurement_object = ""
-                constraints = "Unknown — AI unavailable"
-                closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
-                ai_verified = False
-            elif result is None:
-                # Batch call succeeded but this particular index was missing
-                # from the response — same fallback, just for one item
-                is_relevant = True
-                match_score = "?"
-                reason = "Missing from AI batch response — keyword match only"
-                procurement_object = ""
-                constraints = "Unknown — AI unavailable"
-                closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
-                ai_verified = False
-            else:
-                is_relevant = bool(result.get("relevant", True))
-                match_score = result.get("match_score", "?")
-                reason = result.get("reason", "")
-                procurement_object = result.get("procurement_object", "")
-                # "Not stated in provided text" (not "None identified") is the
-                # correct fallback here — the AI was only shown an excerpt of
-                # the page, so an empty result means "not found in what we
-                # sent it", not "confirmed there are none".
-                constraints = result.get("constraints") or "Not stated in provided text"
-                closing_date = result.get("closing_date") or "Not stated in provided text"
-                ai_verified = True
-
-            # Prefer real API deadline when AI left it unknown / not stated
-            api_deadline = (c.get("deadline") or "").strip()
-            if api_deadline and (
-                not closing_date
-                or closing_date in (
-                    "Unknown — AI unavailable",
-                    "Not stated in provided text",
-                    "?",
-                )
-            ):
-                closing_date = api_deadline
-
-            if not is_relevant:
-                # Log the AI's actual reasoning, not just the title — makes
-                # it possible to sanity-check a borderline rejection (e.g. a
-                # title that LOOKED relevant) without digging through the
-                # WhatsApp thread for context that was never sent there
-                SCAN_REPORT["ai_rejected"] += 1
-                print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
-                # This is a genuine, AI-verified rejection (not a transient
-                # failure — those keep is_relevant forced True above), so it's
-                # safe to permanently mark it and never re-surface it.
-                mark_as_notified(c["id"])
-                continue
-
-            # When AI fails for an item, still surface if the title has a STRONG
-            # keyword. Set SKIP_UNVERIFIED_ALERTS=1 to suppress all unverified.
-            skip_all_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "0").strip().lower() in ("1", "true", "yes")
-            if not ai_verified:
-                title_l = c["title"].lower()
-                strong_hit = any(
-                    k in title_l
-                    for k in (
-                        "dialysis", "hemodialysis", "hemodial", "bbraun", "b braun",
-                        "dialog+", "ultrasound", "x-ray", "xray", "ct scan",
-                        "steriliz", "autoclave", "cssd", "reverse osmosis", "ro system",
-                        "water treatment", "biomedical", "medical imaging",
-                        "maintenance and repair", "calibration",
-                    )
-                )
-                if skip_all_unverified or not strong_hit:
-                    print(f"⏭️ Skipping unverified candidate: {c['title'][:60]}", flush=True)
-                    continue
-                print(f"⚠️ AI unavailable but strong keyword match — queue for approval: {c['title'][:60]}", flush=True)
-
-            # Human-in-the-loop: save as PENDING_APPROVAL for the mobile app.
-            # Do NOT send the full tender details on WhatsApp anymore.
-            try:
-                score_val = match_score if str(match_score).replace(".", "").isdigit() else 0
-                detail_blob = (c.get("detail_text") or c.get("detail") or c.get("description") or reason or "")[:2000]
-                upsert_tender_record(
-                    tender_id=str(c.get("id") or ""),
-                    title=(c.get("title") or "")[:500],
-                    description=detail_blob,
-                    source=(c.get("source") or "")[:120],
-                    deadline=str(closing_date or c.get("deadline") or "")[:80],
-                    relevance_score=score_val,
-                    budget=str(c.get("budget") or "")[:120],
-                    url=(c.get("link") or c.get("url") or "")[:500],
-                    status="PENDING_APPROVAL",
-                    ai_reason=str(reason or "")[:500],
-                    procurement_object=str(procurement_object or "")[:500],
-                    constraints_text=str(constraints or "")[:1000],
-                    force_status=True,  # first time we see it as relevant
-                )
-                mark_as_notified(c["id"])
-                total_sent += 1
-                SCAN_REPORT["queued"] = total_sent
-                print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
-            except Exception as _up_err:
-                print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
-
-    total = total_sent
-    print(f"=================== SCAN COMPLETE: {total} tenders queued for approval ({len(candidates)} candidates reviewed) ===================", flush=True)
-
-    # Short WhatsApp only — full details live in the mobile app for approval
-    if total > 0:
-        send_whatsapp(
-            f"🔔 *{total} new tender(s)* waiting for your approval in the medMETRIC app.\n"
-            f"Open Tenders → review → Approve or Reject."
-        )
-    else:
-        # Optional: quiet scans can skip the "nothing found" message
-        if os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
-            send_whatsapp("🔍 Tender scan completed. No new matches for approval.")
-
-
 def check_for_tenders():
-    """Serialised wrapper: periodic loop and manual /api/scan never overlap."""
-    if not SCAN_LOCK.acquire(blocking=False):
-        print("⏭️ Scan already running — skipping this trigger", flush=True)
-        return
+    global _scan_running, _last_scan
+    with _scan_lock:
+        _, db_running = _load_scan_state_from_db()
+        if _scan_running or db_running:
+            print("⚠️ Scan already running — skipping overlapping trigger.", flush=True)
+            return
+        started = datetime.now(timezone.utc).isoformat()
+        _scan_running = True
+        _last_scan = {
+            "started_at": started,
+            "completed_at": None,
+            "two_merkato_candidates": None,
+            "egp_candidates": None,
+            "queued_for_approval": None,
+            "error": None,
+        }
+        _persist_scan_state(
+            running=True,
+            started_at=started,
+            completed_at=None,
+            two_merkato_candidates=None,
+            egp_candidates=None,
+            queued_for_approval=None,
+            error=None,
+        )
+
+    merkato_found = 0
+    egp_found = 0
+    total_sent = 0
     try:
-        SCAN_REPORT.update({"running": True, "started_at": datetime.now(timezone.utc).isoformat(),
-                            "finished_at": None, "queued": 0, "ai_rejected": 0, "log": []})
-        SCAN_REPORT["sources"]["merkato"].update({"configured": False, "login_ok": None, "raw_links": 0, "relevant": 0,
-                                                  "closed_skipped": 0, "already_notified": 0, "candidates": 0, "error": None})
-        SCAN_REPORT["sources"]["egp"].update({"candidates": 0, "error": None})
-        _check_for_tenders_inner()
+        print("=================== STARTING SCAN CYCLE ===================", flush=True)
+
+        candidates = []  # populated by both scrapers; analyzed in ONE batch AI call below
+
+        try:
+            merkato_found = scrape_2merkato(candidates)
+        except Exception:
+            print("❌ 2merkato engine crashed with an unhandled exception:", flush=True)
+            print(traceback.format_exc(), flush=True)
+            merkato_found = 0
+
+        try:
+            # API-based eGP does not hang like the old Playwright path, so run
+            # in-process to guarantee candidates are returned (subprocess timeout
+            # previously killed a successful 182-item collection before results
+            # could be passed back to the parent).
+            egp_found = scrape_egp(candidates)
+        except Exception:
+            print("❌ eGP engine crashed with an unhandled exception:", flush=True)
+            print(traceback.format_exc(), flush=True)
+            egp_found = 0
+
+        print(f"🧮 {len(candidates)} total candidate tenders collected ({merkato_found} 2merkato, {egp_found} eGP) — running AI review (Groq×2: merkato + eGP)", flush=True)
+
+        total_sent = 0
+        if candidates:
+            # ONE (or a handful of) Groq call(s) for the entire scan cycle, covering
+            # every candidate from both engines — instead of the old per-tender
+            # approach that could burn a day's free-tier quota in a single scan.
+            # NOTE: this only batches the AI ANALYSIS step, not the WhatsApp
+            # notifications — each tender still gets sent as its own message
+            # below, since that's easier to read/forward than one long combined
+            # message.
+            batch_results = batch_analyze_tenders(candidates)
+
+            for i, c in enumerate(candidates):
+                result = batch_results.get(i) if batch_results is not None else None
+
+                if batch_results is None:
+                    # The whole batch call failed even after retries (e.g. quota
+                    # exhausted). Fall back to sending everything that passed the
+                    # keyword filter, clearly flagged as unverified, rather than
+                    # silently dropping legitimate tenders.
+                    is_relevant = True
+                    match_score = "?"
+                    reason = "AI batch analysis unavailable — keyword match only"
+                    procurement_object = ""
+                    constraints = "Unknown — AI unavailable"
+                    closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
+                    ai_verified = False
+                elif result is None:
+                    # Batch call succeeded but this particular index was missing
+                    # from the response — same fallback, just for one item
+                    is_relevant = True
+                    match_score = "?"
+                    reason = "Missing from AI batch response — keyword match only"
+                    procurement_object = ""
+                    constraints = "Unknown — AI unavailable"
+                    closing_date = (c.get("deadline") or "").strip() or "Unknown — AI unavailable"
+                    ai_verified = False
+                else:
+                    is_relevant = bool(result.get("relevant", True))
+                    match_score = result.get("match_score", "?")
+                    reason = result.get("reason", "")
+                    procurement_object = result.get("procurement_object", "")
+                    # "Not stated in provided text" (not "None identified") is the
+                    # correct fallback here — the AI was only shown an excerpt of
+                    # the page, so an empty result means "not found in what we
+                    # sent it", not "confirmed there are none".
+                    constraints = result.get("constraints") or "Not stated in provided text"
+                    closing_date = result.get("closing_date") or "Not stated in provided text"
+                    ai_verified = True
+
+                # Prefer real API deadline when AI left it unknown / not stated
+                api_deadline = (c.get("deadline") or "").strip()
+                if api_deadline and (
+                    not closing_date
+                    or closing_date in (
+                        "Unknown — AI unavailable",
+                        "Not stated in provided text",
+                        "?",
+                    )
+                ):
+                    closing_date = api_deadline
+
+                if not is_relevant:
+                    # Log the AI's actual reasoning, not just the title — makes
+                    # it possible to sanity-check a borderline rejection (e.g. a
+                    # title that LOOKED relevant) without digging through the
+                    # WhatsApp thread for context that was never sent there
+                    print(f"🤖 AI rejected as not relevant, skipping alert: {c['title']} — reason: {reason or '(no reason returned)'}", flush=True)
+                    # This is a genuine, AI-verified rejection (not a transient
+                    # failure — those keep is_relevant forced True above), so it's
+                    # safe to permanently mark it and never re-surface it.
+                    mark_as_notified(c["id"])
+                    continue
+
+                # When AI fails for an item, still surface if the title has a STRONG
+                # keyword. Set SKIP_UNVERIFIED_ALERTS=1 to suppress all unverified.
+                skip_all_unverified = os.environ.get("SKIP_UNVERIFIED_ALERTS", "0").strip().lower() in ("1", "true", "yes")
+                if not ai_verified:
+                    title_l = c["title"].lower()
+                    strong_hit = any(
+                        k in title_l
+                        for k in (
+                            "dialysis", "hemodialysis", "hemodial", "bbraun", "b braun",
+                            "dialog+", "ultrasound", "x-ray", "xray", "ct scan",
+                            "steriliz", "autoclave", "cssd", "reverse osmosis", "ro system",
+                            "water treatment", "biomedical", "medical imaging",
+                            "maintenance and repair", "calibration",
+                        )
+                    )
+                    if skip_all_unverified or not strong_hit:
+                        print(f"⏭️ Skipping unverified candidate: {c['title'][:60]}", flush=True)
+                        continue
+                    print(f"⚠️ AI unavailable but strong keyword match — queue for approval: {c['title'][:60]}", flush=True)
+
+                # Human-in-the-loop: save as PENDING_APPROVAL for the mobile app.
+                # Do NOT send the full tender details on WhatsApp anymore.
+                try:
+                    score_val = match_score if str(match_score).replace(".", "").isdigit() else 0
+                    detail_blob = (c.get("detail_text") or c.get("detail") or c.get("description") or reason or "")[:2000]
+                    upsert_tender_record(
+                        tender_id=str(c.get("id") or ""),
+                        title=(c.get("title") or "")[:500],
+                        description=detail_blob,
+                        source=(c.get("source") or "")[:120],
+                        deadline=str(closing_date or c.get("deadline") or "")[:80],
+                        relevance_score=score_val,
+                        budget=str(c.get("budget") or "")[:120],
+                        url=(c.get("link") or c.get("url") or "")[:500],
+                        status="PENDING_APPROVAL",
+                        ai_reason=str(reason or "")[:500],
+                        procurement_object=str(procurement_object or "")[:500],
+                        constraints_text=str(constraints or "")[:1000],
+                        force_status=True,  # first time we see it as relevant
+                    )
+                    mark_as_notified(c["id"])
+                    total_sent += 1
+                    print(f"📋 Queued for approval: {c['title'][:70]} (score={match_score})", flush=True)
+                except Exception as _up_err:
+                    print(f"⚠️ upsert PENDING_APPROVAL failed: {_up_err}", flush=True)
+
+        total = total_sent
+        print(f"=================== SCAN COMPLETE: {total} tenders queued for approval ({len(candidates)} candidates reviewed) ===================", flush=True)
+
+        # Short WhatsApp only — full details live in the mobile app for approval
+        if total > 0:
+            send_whatsapp(
+                f"🔔 *{total} new tender(s)* waiting for your approval in the medMETRIC app.\n"
+                f"Open Tenders → review → Approve or Reject."
+            )
+        else:
+            # Optional: quiet scans can skip the "nothing found" message
+            if os.environ.get("NOTIFY_EMPTY_SCANS", "0").strip().lower() in ("1", "true", "yes"):
+                send_whatsapp("🔍 Tender scan completed. No new matches for approval.")
+
+    except Exception as scan_err:
+        print("❌ check_for_tenders failed:", flush=True)
+        print(traceback.format_exc(), flush=True)
+        with _scan_lock:
+            _last_scan["error"] = str(scan_err)
+            _persist_scan_state(error=str(scan_err))
     finally:
-        SCAN_REPORT["running"] = False
-        SCAN_REPORT["finished_at"] = datetime.now(timezone.utc).isoformat()
-        SCAN_LOCK.release()
+        with _scan_lock:
+            completed = datetime.now(timezone.utc).isoformat()
+            try:
+                queued = total_sent
+            except Exception:
+                queued = None
+            _last_scan["two_merkato_candidates"] = merkato_found
+            _last_scan["egp_candidates"] = egp_found
+            _last_scan["queued_for_approval"] = queued
+            _last_scan["completed_at"] = completed
+            _scan_running = False
+            _persist_scan_state(
+                running=False,
+                completed_at=completed,
+                two_merkato_candidates=merkato_found,
+                egp_candidates=egp_found,
+                queued_for_approval=queued,
+            )
 
 
 def monitoring_loop():
@@ -1595,12 +1641,75 @@ def manual_test():
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
+    db_ok = database_is_connected()
+
+    with _scan_lock:
+        last, running = _load_scan_state_from_db()
+
     return jsonify({
         "ok": True,
         "service": "tender-notifier",
         "mobile_api": True,
         "approval_workflow": True,
+        "scan_api": True,
         "statuses": sorted(TENDER_STATUSES),
+        "database_connected": db_ok,
+        "sources": ["2merkato", "egp"],
+        "merkato_login_configured": bool(MERKATO_USER and MERKATO_PASS),
+        "scan_running": running,
+        "last_scan": last,
+    })
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    """Mobile-triggered scan of eGP + 2merkato (auth: X-API-KEY / MOBILE_API_KEY).
+
+    Always returns JSON with a clear `status` field the mobile app understands:
+      started | running | recent | denied | unavailable
+    """
+    if not _mobile_api_authorized():
+        return jsonify({
+            "error": "Unauthorized — set the same key as MOBILE_API_KEY on the server in app Settings → Tender API key.",
+            "status": "denied",
+        }), 401
+
+    if not DATABASE_URL or not database_is_connected():
+        return jsonify({
+            "error": "Postgres is not connected on the Tender Notifier service. Check DATABASE_URL on Render.",
+            "status": "unavailable",
+            "database_connected": False,
+        }), 503
+
+    with _scan_lock:
+        last, running = _load_scan_state_from_db()
+        if running or _scan_running:
+            return jsonify({
+                "status": "running",
+                "message": "A scan is already in progress.",
+                "last_scan": last,
+                "database_connected": True,
+            })
+        completed = last.get("completed_at") or _last_scan.get("completed_at")
+        if completed:
+            try:
+                done = datetime.fromisoformat(str(completed).replace("Z", "+00:00"))
+                if datetime.now(timezone.utc) - done < timedelta(minutes=2):
+                    return jsonify({
+                        "status": "recent",
+                        "message": "A scan completed very recently; sync existing records instead of starting another.",
+                        "last_scan": last,
+                        "database_connected": True,
+                    })
+            except Exception:
+                pass
+
+    # Start scan in background; check_for_tenders will mark running in Postgres
+    threading.Thread(target=check_for_tenders, daemon=True).start()
+    return jsonify({
+        "status": "started",
+        "message": "Tender source scan started (eGP + 2merkato). Results are saved to Postgres as PENDING_APPROVAL.",
+        "database_connected": True,
     })
 
 
@@ -1623,9 +1732,6 @@ def _row_to_tender(r):
         d["ai_reason"] = r[11]
         d["procurement_object"] = r[12]
         d["constraints"] = r[13]
-    if len(r) > 15:
-        d["technical_draft"] = r[14]
-        d["financial_draft"] = r[15]
     return d
 
 
@@ -1654,8 +1760,7 @@ def api_list_tenders():
         sql = """
             SELECT id, title, description, source, deadline,
                    relevance_score, status, budget, url, created_at, updated_at,
-                   ai_reason, procurement_object, constraints_text,
-                   technical_draft, financial_draft
+                   ai_reason, procurement_object, constraints_text
             FROM tenders
             WHERE COALESCE(relevance_score, 0) >= %s
         """
@@ -1694,8 +1799,7 @@ def api_get_tender(tender_id):
             """
             SELECT id, title, description, source, deadline,
                    relevance_score, status, budget, url, created_at, updated_at,
-                   ai_reason, procurement_object, constraints_text,
-                   technical_draft, financial_draft
+                   ai_reason, procurement_object, constraints_text
             FROM tenders WHERE id = %s
             """,
             (str(tender_id),),
@@ -1711,169 +1815,116 @@ def api_get_tender(tender_id):
 
 
 def _set_tender_status(tender_id: str, status: str, title_fallback: str = ""):
-    """Update a tender's status and return the full row dict.
+    """Internal helper: update status and return the full row dict."""
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO tenders (id, title, status, updated_at)
+        VALUES (%s, %s, %s, NOW())
+        ON CONFLICT (id) DO UPDATE SET
+            status = EXCLUDED.status,
+            updated_at = NOW()
+        RETURNING id, title, description, source, deadline,
+                  relevance_score, status, budget, url, created_at, updated_at,
+                  ai_reason, procurement_object, constraints_text
+        """,
+        (str(tender_id), (title_fallback or str(tender_id))[:500], status),
+    )
+    row = cur.fetchone()
+    conn.commit()
+    cur.close()
+    return _row_to_tender(row) if row else None
 
-    Unknown ids return None (-> HTTP 404). A row is only created when the caller
-    explicitly supplies a title (phone-originated tender), never from a bare id.
+
+def prepare_documents_for_tender(tender_id: str):
     """
-    cols = """id, title, description, source, deadline,
-              relevance_score, status, budget, url, created_at, updated_at,
-              ai_reason, procurement_object, constraints_text,
-              technical_draft, financial_draft"""
-    conn = get_db_connection()
-    cur = conn.cursor()
+    Called after human APPROVE.
+    Phase 1 stub: mark DOCS_READY and log.
+    Phase 2 (next): generate Technical + Financial .docx/.pdf using samples + AI.
+    """
+    print(f"📄 Document preparation started for tender {tender_id}", flush=True)
     try:
-        if title_fallback:
-            cur.execute(
-                f"""
-                INSERT INTO tenders (id, title, status, updated_at)
-                VALUES (%s, %s, %s, NOW())
-                ON CONFLICT (id) DO UPDATE SET status = EXCLUDED.status, updated_at = NOW()
-                RETURNING {cols}
-                """,
-                (str(tender_id), title_fallback[:500], status),
-            )
-        else:
-            cur.execute(
-                f"UPDATE tenders SET status = %s, updated_at = NOW() WHERE id = %s RETURNING {cols}",
-                (status, str(tender_id)),
-            )
-        row = cur.fetchone()
-        conn.commit()
-        return _row_to_tender(row) if row else None
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        cur.close()
-
-
-def _get_tender_status(tender_id: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT status, title FROM tenders WHERE id = %s", (str(tender_id),))
-        row = cur.fetchone()
-        conn.commit()  # end the read transaction on the shared connection
-        return row
-    finally:
-        cur.close()
-
-
-def _notify_approved(tender_id: str, title: str):
-    """Short, truthful WhatsApp note. Documents are drafted on the phone, not here."""
-    try:
+        if not DATABASE_URL:
+            return
+        # Placeholder until sample proposals are provided and generation is wired
+        _set_tender_status(tender_id, "DOCS_READY")
+        print(f"✅ Tender {tender_id} marked DOCS_READY (stub — real generation coming next)", flush=True)
         send_whatsapp(
-            f"✅ Tender approved: {title or tender_id}\n"
-            f"Open the medMETRIC app → Tenders → Prepare documents."
+            f"✅ Tender approved.\n"
+            f"Document preparation started for: {tender_id}\n"
+            f"(Technical + Financial drafts will appear in the app shortly.)"
         )
     except Exception as e:
-        print(f"⚠️ approve notification failed: {e}", flush=True)
-
-
-def _apply_status(tender_id: str, status: str, title: str = ""):
-    """Shared by /status, /approve, /reject. Returns a Flask response."""
-    if not DATABASE_URL:
-        return jsonify({"id": tender_id, "status": status})
-    try:
-        previous = _get_tender_status(tender_id)
-        if previous is None and not title:
-            return jsonify({"error": "tender not found in cloud"}), 404
-        # Approving twice must not re-notify.
-        if previous and previous[0] == status:
-            row = _set_tender_status(tender_id, status)
-            return jsonify(row)
-        row = _set_tender_status(tender_id, status, title_fallback=title)
-        if not row:
-            return jsonify({"error": "tender not found in cloud"}), 404
-        if status == "APPROVED":
-            _notify_approved(tender_id, row.get("title") or "")
-        return jsonify(row)
-    except Exception as e:
-        print(f"❌ _apply_status({tender_id}, {status}): {e}", flush=True)
-        return jsonify({"error": str(e)}), 500
+        print(f"❌ prepare_documents_for_tender failed: {e}", flush=True)
+        try:
+            _set_tender_status(tender_id, "DOCS_FAILED")
+        except Exception:
+            pass
 
 
 @app.route("/api/tenders/<tender_id>/status", methods=["PATCH", "POST"])
 def api_update_tender_status(tender_id):
-    """Update tender status (Approve / Reject / DOCS_READY / Won / Lost / ...).
+    """Update tender status (Approve / Reject / Won / Lost / ...).
 
-    Body: {"status": "DOCS_READY"}  (optional "title" to create a phone-originated tender)
-    Documents are drafted on the phone; it reports DOCS_READY / DOCS_FAILED here.
+    Body: {"status": "APPROVED"} or {"status": "REJECTED"} etc.
+    When status becomes APPROVED, document preparation is triggered in background.
     """
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
+
     body = request.get_json(silent=True) or {}
     status = (body.get("status") or "").upper().strip()
     if status not in TENDER_STATUSES:
         return jsonify({"error": f"status must be one of {sorted(TENDER_STATUSES)}"}), 400
-    return _apply_status(tender_id, status, body.get("title") or "")
+
+    if not DATABASE_URL:
+        return jsonify({"id": tender_id, "status": status})
+
+    try:
+        row = _set_tender_status(tender_id, status, title_fallback=body.get("title") or "")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+
+        # APPROVED stays APPROVED until explicit prepare_documents_for_tender
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ api_update_tender_status: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/tenders/<tender_id>/approve", methods=["POST"])
 def api_approve_tender(tender_id):
-    """Approve a tender. Status becomes APPROVED; DOCS_READY is set only when the phone has drafts."""
+    """Convenience endpoint: Approve a tender (same as status=APPROVED)."""
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
-    return _apply_status(tender_id, "APPROVED")
+    if not DATABASE_URL:
+        return jsonify({"id": tender_id, "status": "APPROVED"})
+    try:
+        row = _set_tender_status(tender_id, "APPROVED")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        # Stay on APPROVED — document prep is a separate step (app or /prepare-docs)
+        return jsonify(row)
+    except Exception as e:
+        print(f"❌ api_approve_tender: {e}", flush=True)
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/tenders/<tender_id>/reject", methods=["POST"])
 def api_reject_tender(tender_id):
-    """Reject a tender."""
-    if not _mobile_api_authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-    return _apply_status(tender_id, "REJECTED")
-
-
-@app.route("/api/scan", methods=["POST"])
-def api_scan_now():
-    """Start a scan in the background (phone: "Scan now")."""
-    if not _mobile_api_authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-    if SCAN_REPORT.get("running"):
-        return jsonify({"running": True}), 200
-    threading.Thread(target=check_for_tenders, daemon=True).start()
-    return jsonify({"started": True}), 202
-
-
-@app.route("/api/scan-report", methods=["GET"])
-def api_scan_report():
-    if not _mobile_api_authorized():
-        return jsonify({"error": "Unauthorized"}), 401
-    return jsonify(SCAN_REPORT)
-
-
-@app.route("/api/tenders/<tender_id>/drafts", methods=["POST", "PUT"])
-def api_save_drafts(tender_id):
-    """Back up the phone-generated drafts so they survive reinstalls."""
+    """Convenience endpoint: Reject a tender."""
     if not _mobile_api_authorized():
         return jsonify({"error": "Unauthorized"}), 401
     if not DATABASE_URL:
-        return jsonify({"id": tender_id, "status": "DOCS_READY"})
-    body = request.get_json(silent=True) or {}
-    tech = str(body.get("technical") or "")[:60000]
-    fin = str(body.get("financial") or "")[:60000]
+        return jsonify({"id": tender_id, "status": "REJECTED"})
     try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        try:
-            cur.execute(
-                "UPDATE tenders SET technical_draft = %s, financial_draft = %s, status = 'DOCS_READY', updated_at = NOW() WHERE id = %s",
-                (tech, fin, str(tender_id)),
-            )
-            n = cur.rowcount
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            cur.close()
-        if not n:
-            return jsonify({"error": "tender not found in cloud"}), 404
-        return jsonify({"id": tender_id, "status": "DOCS_READY"})
+        row = _set_tender_status(tender_id, "REJECTED")
+        if not row:
+            return jsonify({"error": "not found"}), 404
+        return jsonify(row)
     except Exception as e:
-        print(f"❌ api_save_drafts: {e}", flush=True)
+        print(f"❌ api_reject_tender: {e}", flush=True)
         return jsonify({"error": str(e)}), 500
 
 
@@ -1881,8 +1932,25 @@ def api_save_drafts(tender_id):
 # `python app.py` local runs and gunicorn/production imports)
 init_db()
 
+# Under gunicorn __name__ is not "__main__", so the scanner never started.
+# Start the background eGP/2merkato loop on import (safe with workers=1).
+_monitor_started = False
+_monitor_lock = threading.Lock()
+
+def _ensure_monitor_started():
+    global _monitor_started
+    if os.environ.get("DISABLE_MONITOR", "").strip().lower() in ("1", "true", "yes"):
+        return
+    with _monitor_lock:
+        if _monitor_started:
+            return
+        _monitor_started = True
+        threading.Thread(target=monitoring_loop, daemon=True).start()
+        print("📡 Background tender monitor started (eGP + 2merkato)", flush=True)
+
+_ensure_monitor_started()
+
 if __name__ == "__main__":
-    threading.Thread(target=monitoring_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 

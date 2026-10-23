@@ -41,7 +41,6 @@ Set these in **Render Dashboard → your Web Service → Environment**.
 | `GROQ_MAX_TOKENS` | `2048` | Max completion tokens |
 | `AI_CHUNK_SIZE` | `3` | Batch size for AI |
 | `MERKATO_MAX_PAGES` | `4` | 2merkato pages |
-| `MERKATO_TIME_BUDGET_SEC` | `420` | Hard time limit for the 2merkato part of a scan |
 | `MERKATO_MAX_PAGES_PER_TERM` | `3` | Pages per search term |
 
 ## Mobile app settings (not Render)
@@ -57,17 +56,15 @@ On the phone **Settings**:
 
 ```
 GET  /api/health
-GET  /api/tenders?status=PENDING_APPROVAL
+POST /api/scan          ← mobile "Sync & scan open tenders"
+GET  /api/tenders?status=PENDING_APPROVAL,APPROVED,...
 POST /api/tenders/<id>/approve
 POST /api/tenders/<id>/reject
-POST /api/tenders/<id>/drafts   {technical, financial}  -> DOCS_READY (backup of phone drafts)
-POST /api/scan                  start a scan now
-GET  /api/scan-report           why 2merkato/eGP did or didn't return tenders
 ```
 
-Read the report: `curl -H "X-API-KEY: $MOBILE_API_KEY" https://YOUR-SERVICE.onrender.com/api/scan-report`
+Scan results are written to Postgres (`tenders` table, status `PENDING_APPROVAL`).
+Scan progress is shared across workers via the `scan_status` table.
 
-> Render's free Postgres expires after 30 days. If it expires, every tender (including approved ones) is deleted. Upgrade it or export regularly.
 
 Header: `X-API-KEY: <MOBILE_API_KEY>`
 
